@@ -1,0 +1,46 @@
+name: cninfo-ann-watch
+
+on:
+  schedule:
+    - cron: "7 * * * *"        # 每小时 07 分（cron 走 UTC，但每小时都跑所以时区无影响）
+  workflow_dispatch:
+
+permissions:
+  contents: write              # 提交 feed + state.json
+  pages: write                 # 发布到 Pages
+  id-token: write
+
+concurrency:
+  group: cninfo-ann
+  cancel-in-progress: false
+
+jobs:
+  fetch-and-deploy:            # 单 job：避免"deploy 拿到旧 HEAD"的时序坑（hudong-rss 踩过）
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: 安装依赖
+        run: pip install pypdf
+
+      - name: 抓取 + 筛选（全市场公告 → 标题粗筛 → 下 PDF → 正文词库匹配）
+        run: python scripts/fetch_ann.py --days 3
+
+      - name: 提交 feed 与 state
+        run: |
+          git config user.name "cninfo-ann-bot"
+          git config user.email "actions@users.noreply.github.com"
+          git add feed/rss.xml state.json
+          git diff --cached --quiet || git commit -m "update feed"
+          git pull --rebase --autostash || true
+          git push
+
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: feed
+      - uses: actions/deploy-pages@v4
