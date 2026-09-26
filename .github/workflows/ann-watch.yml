@@ -39,6 +39,8 @@ jobs:
           git pull --rebase --autostash || true
           git push
 
+      - name: 通知 jsdelivr 刷新缓存（FreshRSS 走 jsdelivr 订阅时必须要有这步）
+        run: curl -s "https://purge.jsdelivr.net/gh/liuchao88/cninfo-ann-rss@main/feed/rss.xml" > /dev/null || true
       - uses: actions/configure-pages@v5
       - uses: actions/upload-pages-artifact@v3
         with:
