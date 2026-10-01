@@ -52,6 +52,9 @@ MAX_PDF = 600          # 单轮最多下载多少份 PDF（保险丝）
 MAX_PAGES = 80         # 单份 PDF 最多抽多少页（超长报告截断）
 MAX_MB = 20            # 单份 PDF 最大下载体积
 WINDOW_DAYS = 3        # 每次抓最近几天（巨潮按天查不稳，必须重叠兜底）
+RELATION_ENABLE = True # 同时抓「调研记录表」（巨潮 调研 tab；2026-10-01 加）
+RELATION_FILTER = True # True=调研也要过词库（实测 69% 命中，约 17 条/天）；False=调研全部进 feed（约 25 条/天）
+RELATION_SKIP_RE = re.compile(r"与会清单|参会人员|参会名单|名单附件")   # 同一场调研的附件，剔掉留正文那份
 
 # 标题粗筛：通用事件词（不含主题词，主题词交给正文匹配）
 EVENT_WORDS = ["定点", "中标", "合同", "订单", "供货", "供货协议", "投资", "收购", "并购", "重组",
@@ -95,11 +98,12 @@ def http(url, data=None, headers=None, timeout=60, retry=3):
     raise last
 
 
-def day_list(plate, date):
-    """拿某天某市场的全部公告（翻页，巨潮每次最多给 30 条）"""
+def day_list(plate, date, tab="fulltext"):
+    """拿某天某市场的公告（翻页，巨潮每次最多给 30 条）。
+       tab="fulltext" = 正式公告；tab="relation" = 调研记录表（巨潮页面上的「调研」页，2026-10-01 实测）"""
     out, page = [], 1
     while page <= 60:
-        p = dict(plate=plate, column=("szse" if plate == "sz" else "sse"), tabName="fulltext", stock="",
+        p = dict(plate=plate, column=("szse" if plate == "sz" else "sse"), tabName=tab, stock="",
                  searchkey="", secid="", category="", trade="", sortName="", sortType="",
                  isHLtitle="true", pageNum=page, pageSize=30, seDate=date + "~" + date)
         try:
@@ -185,6 +189,44 @@ def pdf_text(url):
     return txt, len(rd.pages)
 
 
+def check_pdf(x, kind, strong, weak, demoted, results, seen):
+    """下载一份 PDF → 抽正文 → 剔样板句 → 过词库 → 命中就加进 results。
+       返回 (是否命中, 是否成功下载)。无论成败都把 id 记进 seen，免得下轮重复下载。"""
+    title = (x.get("announcementTitle") or "").replace("<em>", "").replace("</em>", "")
+    url = "http://static.cninfo.com.cn/" + (x.get("adjunctUrl") or "")
+    try:
+        txt, pages = pdf_text(url)
+    except Exception as e:
+        log("  ✗ %s %s | %s" % (x.get("secCode"), title[:26], str(e)[:60]))
+        seen.add(x.get("announcementId") or "")
+        return False, False
+    code = x.get("secCode") or ""
+    body = strip_boiler(txt)
+    s, wk, dm = match(body, strong, weak, demoted)
+    seen.add(x.get("announcementId") or "")
+    ok = bool(s) or (len(wk) + len(dm)) >= 2
+    if kind == "调研" and not RELATION_FILTER:
+        ok = True                                   # 口径开关：调研不过词库、全收
+    if not ok:
+        return False, True
+    tags = s + wk + dm
+    for r in results:                               # 同公司同一天、标题高度相似 → 只留一份
+        if r["code"] == code and abs(r["time"] - int(x.get("announcementTime") or 0)) < 86400000:
+            import difflib
+            if difflib.SequenceMatcher(None, r["title"], title, autojunk=False).ratio() >= 0.55:
+                return False, True
+    results.append({
+        "code": code, "name": x.get("secName"), "title": title, "kind": kind,
+        "url": url, "time": int(x.get("announcementTime") or 0), "pages": pages,
+        "org": x.get("orgId") or "",
+        "strong": s[:8], "weak": wk[:8], "demoted": dm[:4],
+        "snippet": snippet(txt, tags[0]) if tags else ""})
+    log("  ✔[%s] %s %s | %d页 | 强档 %s | 弱档 %s | 降级 %s" % (
+        kind, code, title[:30], pages, "、".join(s[:3]) or "无",
+        "、".join(wk[:3]) or "无", "、".join(dm[:2]) or "无"))
+    return True, True
+
+
 def xml_escape(s):
     return (s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"))
 
@@ -203,12 +245,17 @@ def write_feed(hits, path):
         ts = (h.get("time") or 0) / 1000.0
         dt = datetime.fromtimestamp(ts, TZ) if ts else datetime.now(TZ)
         tags = (h.get("strong") or []) + (h.get("weak") or []) + (h.get("demoted") or [])
-        title = "[%s%s][%s] %s" % (h.get("name") or "", h.get("code") or "", "、".join(tags[:3]), h.get("title") or "")
+        kind = h.get("kind") or "公告"
+        title = "[%s%s][%s] %s%s" % (h.get("name") or "", h.get("code") or "", "、".join(tags[:3]),
+                                     ("调研 · " if kind == "调研" else ""), h.get("title") or "")
         desc = "命中词：%s%s%s\n%s\n原文 PDF：%s" % (
             "、".join(h.get("strong") or []) or "无",
             ("｜" + "、".join(h.get("weak") or [])) if h.get("weak") else "",
             ("｜降级词：" + "、".join(h.get("demoted") or [])) if h.get("demoted") else "",
             h.get("snippet") or "", h.get("url") or "")
+        if h.get("org"):     # 巨潮个股页（点公司名直达该公司公告列表）；wecom_push 从这行里取 orgId
+            desc += "\n公司页：http://www.cninfo.com.cn/new/disclosure/stock?stockCode=%s&orgId=%s" % (
+                h.get("code") or "", h.get("org"))
         out.append("<item>")
         out.append("<title>%s</title>" % xml_escape(title))
         out.append("<link>%s</link>" % xml_escape(h.get("url") or FEED_LINK))
@@ -268,39 +315,33 @@ def main():
 
     results, scanned, failed = [], 0, 0
     for x in new[:a.limit]:
-        title = (x.get("announcementTitle") or "").replace("<em>", "").replace("</em>", "")
-        url = "http://static.cninfo.com.cn/" + (x.get("adjunctUrl") or "")
-        try:
-            txt, pages = pdf_text(url)
-        except Exception as e:
-            failed += 1
-            log("  ✗ %s %s | %s" % (x.get("secCode"), title[:26], str(e)[:60]))
-            seen.add(x.get("announcementId") or "")
-            continue
-        scanned += 1
-        body = strip_boiler(txt)                      # 先剔掉免责样板句，再匹配
-        s, wk, dm = match(body, strong, weak, demoted)
-        ok = bool(s) or (len(wk) + len(dm)) >= 2
-        if ok:
-            tags = s + wk + dm
-            dup = False
-            for r in results:                         # 同公司同一天、标题高度相似 → 只留一份
-                if r["code"] == x.get("secCode") and abs(r["time"] - int(x.get("announcementTime") or 0)) < 86400000:
-                    import difflib
-                    if difflib.SequenceMatcher(None, r["title"], title, autojunk=False).ratio() >= 0.55:
-                        dup = True
-                        break
-            if not dup:
-                results.append({
-                    "code": x.get("secCode"), "name": x.get("secName"), "title": title,
-                    "url": url, "time": int(x.get("announcementTime") or 0), "pages": pages,
-                    "strong": s[:8], "weak": wk[:8], "demoted": dm[:4],
-                    "snippet": snippet(txt, tags[0]) if tags else ""})
-                log("  ✔ %s %s | %d页 | 强档 %s | 弱档 %s | 降级 %s" % (
-                    x.get("secCode"), title[:30], pages, "、".join(s[:3]) or "无",
-                    "、".join(wk[:3]) or "无", "、".join(dm[:2]) or "无"))
-        seen.add(x.get("announcementId") or "")
+        hit, got = check_pdf(x, "公告", strong, weak, demoted, results, seen)
+        scanned += 1 if got else 0
+        failed += 0 if got else 1
         time.sleep(0.2)
+
+    # ---- 调研记录表（2026-10-01 新增）：标题里通常没有事件词，不粗筛，直接下 PDF 过词库 ----
+    if RELATION_ENABLE:
+        rels, uniqr = [], {}
+        for d in days:
+            for plate in ("sz", "sh"):
+                lst = day_list(plate, d, tab="relation")
+                if lst:
+                    log("  调研 %s %s：%d 条" % (d, plate, len(lst)))
+                rels += lst
+        for x in rels:
+            uniqr[x.get("announcementId") or x.get("adjunctUrl")] = x
+        rels = [x for x in uniqr.values()
+                if not RELATION_SKIP_RE.search(x.get("announcementTitle") or "")
+                and (x.get("announcementId") or "") not in seen]
+        log("调研记录表 %d 条（已剔附件清单、去掉处理过的）" % len(rels))
+        r0 = len(results)
+        for x in rels[:a.limit]:
+            hit, got = check_pdf(x, "调研", strong, weak, demoted, results, seen)
+            scanned += 1 if got else 0
+            failed += 0 if got else 1
+            time.sleep(0.2)
+        log("调研通过 %d 条" % (len(results) - r0))
 
     log("=" * 60)
     log("下载 %d 份 PDF（失败 %d）→ 通过筛选 %d 条，通过率 %.0f%%" % (scanned, failed, len(results),
