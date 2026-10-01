@@ -32,7 +32,7 @@
 ## 文件
 
 ```
-AI_KEYWORDS.json                   词库本地副本（真源是 hudong-rss 仓库那份，运行时优先拉远程）
+AI_KEYWORDS.json                    （已删除）词库搬到独立仓库 →
 scripts/fetch_ann.py               抓取 + 筛选 + 生成 RSS
 .github/workflows/ann-watch.yml    每小时跑一次（GitHub cron 有稀释，实际 1~3 小时一次）
 feed/rss.xml                       产物（由 Action 自动提交）
@@ -65,5 +65,7 @@ python scripts/fetch_ann.py --feed-only     # 只按 state.json 重新生成 fee
 
 ## 与 hudong-rss 的关系
 
-词库只有一份真源：`liuchao88/hudong-rss` 仓库的 `AI_KEYWORDS.json`（每周一自动补词）。
-本仓库保留一份副本作为"远程取不到时的兜底"。所以**改词只改 hudong-rss 那份**。
+词库唯一真源：`liuchao88/a-share-keywords` 仓库（每周一自动补词，按行业分文件、每个文件带 enabled 开关）。
+本仓库运行时读 `keywords/index.json` → 逐个取 `enabled: true` 的行业文件 → 合并。
+取不到就**这一轮不抓**（先前的"本地副本兜底"已删除：用过期词库筛是隐性漏，比不抓更糟）。
+**改词只改 a-share-keywords 那一份**，不要在本仓库留副本。

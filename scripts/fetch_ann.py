@@ -28,14 +28,17 @@ from email.utils import format_datetime
 from io import BytesIO
 
 BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))   # 仓库根目录
-KW_PATH = os.path.join(BASE, "AI_KEYWORDS.json")
+KW_PATH = os.path.join(BASE, "AI_KEYWORDS.json")   # 已废弃（词库搬到 a-share-keywords 仓库），留着只是避免老引用报错
 STATE_PATH = os.path.join(BASE, "state.json")
 FEED_DIR = os.path.join(BASE, "feed")
 FEED_PATH = os.path.join(FEED_DIR, "rss.xml")
 
-# 词库单一真源：hudong-rss 仓库那份（每周一自动补词）。取不到才用本仓库副本。
-KW_REMOTE = ["https://cdn.jsdelivr.net/gh/liuchao88/hudong-rss@main/AI_KEYWORDS.json",
-             "https://raw.githubusercontent.com/liuchao88/hudong-rss/main/AI_KEYWORDS.json"]
+# 词库唯一真源：a-share-keywords 仓库（每周一自动补词，按行业分文件 + 各自 enabled 开关）。
+# 流程：取 index.json 拿行业文件名 → 逐个取 enabled=true 的合并。取不到就本轮跳过（不用过期副本）。
+KW_INDEX = ["https://cdn.jsdelivr.net/gh/liuchao88/a-share-keywords@main/keywords/index.json",
+            "https://raw.githubusercontent.com/liuchao88/a-share-keywords/main/keywords/index.json"]
+KW_BASE = ["https://cdn.jsdelivr.net/gh/liuchao88/a-share-keywords@main/keywords/",
+           "https://raw.githubusercontent.com/liuchao88/a-share-keywords/main/keywords/"]
 
 # 公告里到处是模板语言的强档词：降级处理（单命中不算，要和别的词一起才过关）
 # 实测："重组"曾让 122 条命中里 50 条单靠它过关（不构成重大资产重组 / 关联交易 / 债务重组 / 重组疫苗…）
@@ -122,37 +125,66 @@ def day_list(plate, date, tab="fulltext"):
     return out
 
 
-def load_words():
-    """读词库：优先从 hudong-rss 仓库取（那边每周一自动补词，单一真源），失败退回本地副本"""
-    D, src = None, None
-    for u in KW_REMOTE:
-        try:
-            D = json.loads(http(u, timeout=30, retry=1).decode("utf-8"))
-            src = u.split("/")[2]
-            break
-        except Exception:
-            continue
-    if D is None:
-        D = json.load(open(KW_PATH, encoding="utf-8"))
-        src = "本地副本 %s" % os.path.basename(KW_PATH)
-    log("词库来源：%s（updated_at %s）" % (src, D.get("updated_at")))
+def merge_dicts(dicts):
+    """把多份行业词库合成 (强档, 弱档, 降级词)"""
     strong, weak = set(), set()
-    sw = D.get("signal_weights") or {}
-    strong |= {w.strip() for w in (sw.get("critical") or []) if w.strip()}
-    strong |= {w.strip() for w in (sw.get("high") or []) if w.strip()}
-    weak |= {w.strip() for w in (sw.get("medium") or []) if w.strip()}
-    weak |= {w.strip() for w in (sw.get("low") or []) if w.strip()}
-    for c in D.get("categories") or []:
-        for w in (c.get("keywords") or []):
-            if w.strip(): weak.add(w.strip())
-        for s in (c.get("subcategories") or []):
-            for w in (s.get("keywords") or []):
+    for D in dicts:
+        sw = D.get("signal_weights") or {}
+        strong |= {w.strip() for w in (sw.get("critical") or []) if w.strip()}
+        strong |= {w.strip() for w in (sw.get("high") or []) if w.strip()}
+        weak |= {w.strip() for w in (sw.get("medium") or []) if w.strip()}
+        weak |= {w.strip() for w in (sw.get("low") or []) if w.strip()}
+        for c in D.get("categories") or []:
+            for w in (c.get("keywords") or []):
                 if w.strip(): weak.add(w.strip())
-    for w in (D.get("entities") or []):
-        if w.strip(): weak.add(w.strip())
+            for s in (c.get("subcategories") or []):
+                for w in (s.get("keywords") or []):
+                    if w.strip(): weak.add(w.strip())
+        for w in (D.get("entities") or []):
+            if w.strip(): weak.add(w.strip())
     demoted = strong & DEMOTE_STRONG             # 模板词降级：自己不算强档，最多算 1 个弱档名额
     strong -= demoted
     return strong, weak, demoted
+
+
+def load_words():
+    """读词库：唯一真源是 a-share-keywords 仓库。
+       取 index.json → 逐个取 enabled=true 的行业文件 → 合并。
+       任何一步拿不到就返回 None（本轮跳过、不抓）：用过期副本筛是"隐性漏"（新词命中的公告会被静默丢掉），
+       比这一轮不抓更糟；下一轮会自动补上。"""
+    idx = None
+    for u in KW_INDEX:
+        try:
+            idx = json.loads(http(u, timeout=30, retry=1).decode("utf-8"))
+            break
+        except Exception:
+            continue
+    if not idx:
+        log("index.json 取不到（jsdelivr 与 raw 都不通）→ 本轮跳过")
+        return None, None, None
+    D, files, off = [], [], []
+    for name in idx.get("files") or []:
+        got = None
+        for base in KW_BASE:
+            try:
+                got = json.loads(http(base + name, timeout=30, retry=1).decode("utf-8"))
+                break
+            except Exception:
+                continue
+        if not got:
+            log("  ✗ %s 取不到，跳过" % name)
+            continue
+        if not got.get("enabled", True):
+            off.append(name)
+            continue
+        D.append(got)
+        files.append(name)
+    if not D:
+        log("没有任何生效的行业词库 → 本轮跳过")
+        return None, None, None
+    log("词库来源：a-share-keywords（生效 %s%s）" % ("、".join(files),
+        ("；跳过 enabled=false 的 " + "、".join(off)) if off else ""))
+    return merge_dicts(D)
 
 
 def is_ascii(w):
@@ -284,6 +316,9 @@ def main():
         return 0
 
     strong, weak, demoted = load_words()
+    if strong is None:
+        log("词库不可用 → 这一轮不抓（下一轮自动补；不用旧词库硬筛）")
+        return 0
     log("词库：强档 %d 词 / 弱档 %d 词 / 降级词 %d 个（%s）" % (len(strong), len(weak), len(demoted), "、".join(sorted(demoted))))
 
     state = {"seen": [], "hits": []}
