@@ -65,7 +65,8 @@ python scripts/fetch_ann.py --feed-only     # 只按 state.json 重新生成 fee
 
 ## 与 hudong-rss 的关系
 
-词库唯一真源：`liuchao88/a-share-keywords` 仓库（每周一自动补词，按行业分文件、每个文件带 enabled 开关）。
-本仓库运行时读 `keywords/index.json` → 逐个取 `enabled: true` 的行业文件 → 合并。
+词库唯一真源：`liuchao88/a-share-keywords` 仓库（每周一自动补词，按行业分文件；开关集中在它的 index.json 里）。
+本仓库运行时读它的 `keywords/index.json`（`industries` 清单）→ 逐个取 `enabled: true` 的行业文件 → 合并词表与权重。
+**开关（enabled）集中在 index.json 里改**，行业文件本身只有词汇。
 取不到就**这一轮不抓**（先前的"本地副本兜底"已删除：用过期词库筛是隐性漏，比不抓更糟）。
 **改词只改 a-share-keywords 那一份**，不要在本仓库留副本。

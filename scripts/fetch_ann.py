@@ -155,15 +155,25 @@ def load_words():
     idx = None
     for u in KW_INDEX:
         try:
-            idx = json.loads(http(u, timeout=30, retry=1).decode("utf-8"))
-            break
+            got = json.loads(http(u, timeout=30, retry=1).decode("utf-8"))
         except Exception:
             continue
+        if got.get("industries"):
+            idx = got
+            break
+        # 拉到了但结构不对（典型原因：CDN 还缓存着旧版 index.json）→ 换下一个源，别拿它当"没有生效行业"
+        log("  %s 返回的 index.json 没有 industries 字段（疑似 CDN 旧缓存），换下一个源" % u.split("/")[2])
     if not idx:
-        log("index.json 取不到（jsdelivr 与 raw 都不通）→ 本轮跳过")
+        log("index.json 取不到可用的（jsdelivr 与 raw 都不通，或都是旧版）→ 本轮跳过")
         return None, None, None
     D, files, off = [], [], []
-    for name in idx.get("files") or []:
+    for ent in idx.get("industries") or []:
+        name = ent.get("file")
+        if not name:
+            continue
+        if not ent.get("enabled", True):       # 开关在 index.json 里，关掉的行业连拉都不用拉
+            off.append(name)
+            continue
         got = None
         for base in KW_BASE:
             try:
@@ -173,9 +183,6 @@ def load_words():
                 continue
         if not got:
             log("  ✗ %s 取不到，跳过" % name)
-            continue
-        if not got.get("enabled", True):
-            off.append(name)
             continue
         D.append(got)
         files.append(name)
